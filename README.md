@@ -1,6 +1,6 @@
-# Installing MediaPipe and Related Libraries on Windows (Conda + PowerShell)
+# Installing MediaPipe and Related Libraries
 
-This guide explains how to create an isolated Python environment using Conda on Windows (PowerShell or Anaconda Prompt) and install MediaPipe, OpenCV, NumPy, pygame, and other dependencies needed for this project. It includes steps to create the environment, install compatible package versions (note: MediaPipe requires `numpy < 2`), verify the installation, and troubleshoot common issues.
+This guide explains how to create an isolated Python environment using Conda and install MediaPipe, OpenCV, NumPy, pygame, and other dependencies needed for this project. It includes steps to create the environment, install compatible package versions (note: MediaPipe requires `numpy < 2`), verify the installation, and troubleshoot common issues.
 
 ---
 
