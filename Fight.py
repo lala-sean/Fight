@@ -46,11 +46,17 @@ ORANGE = (255, 170, 0)
 GOLD   = (255, 210, 60)
 SHADOW = (0, 0, 0, 60)  # for reference
 
+# =========================
 # Fighter props
+# =========================
 FIGHTER_BASE_W = 60
 FIGHTER_BASE_H = 80
-FIGHTER_SPEED  = 3
+# 步长加倍：原本为 3，这里改为 6（因 move_* 里乘以 3，整体位移翻倍）
+FIGHTER_SPEED  = 6
 PUNCH_RANGE    = 80
+
+# 是否镜像输入（摄像头左右相反时设为 True；若以后不用镜像，可改 False）
+MIRROR_INPUT = True
 
 # Game props
 FPS        = 60
@@ -404,7 +410,6 @@ def draw_cartoon_fighter(screen, x, y, facing_right=True, action="idle", main_co
         right_hand = [x + dir_sign * int(fw*0.62), shoulder_y + int(fh*0.06)]
 
     # arms (upper from shoulder to elbow, lower elbow to hand)
-    # We simplify as one limb segment cartoon-style
     limb_th = max(8, int(fw*0.17))
     glove_col = (255, 245, 245)
     # left arm
@@ -556,16 +561,42 @@ def detect_elbow_angles(landmarks):
         RSH = get_pt(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value)
         REL = get_pt(landmarks, mp_pose.PoseLandmark.RIGHT_ELBOW.value)
         RWR = get_pt(landmarks, mp_pose.PoseLandmark.RIGHT_WRIST.value)
-        la = angle_between(LSH, LEL, LWR)
-        ra = angle_between(RSH, REL, RWR)
-        if la is None or ra is None:
-            return {"left_angle": None, "right_angle": None, "left_attack": False, "right_attack": False, "combo": False}
-        left_attack = la < 90.0
-        right_attack = ra < 90.0
-        return {"left_angle": la, "right_angle": ra, "left_attack": left_attack, "right_attack": right_attack,
-                "combo": left_attack and right_attack}
-    except:
-        return {"left_angle": None, "right_angle": None, "left_attack": False, "right_attack": False, "combo": False}
+
+        # === NEW: check visibility / in-frame ===
+        def in_frame(pt):
+            return 0.0 <= pt[0] <= 1.0 and 0.0 <= pt[1] <= 1.0
+
+        left_valid  = in_frame(LEL) and in_frame(LWR)
+        right_valid = in_frame(REL) and in_frame(RWR)
+
+        la = angle_between(LSH, LEL, LWR) if left_valid else 0.0
+        ra = angle_between(RSH, REL, RWR) if right_valid else 0.0
+
+        if la is None: la = 0.0
+        if ra is None: ra = 0.0
+
+        # Trigger logic remains the same
+        left_attack = la > 90.0
+        right_attack = ra > 90.0
+
+        return {
+            "left_angle": la,
+            "right_angle": ra,
+            "left_attack": left_attack,
+            "right_attack": right_attack,
+            "combo": left_attack and right_attack
+        }
+
+    except Exception as e:
+        print(f"[detect_elbow_angles] error: {e}")
+        return {
+            "left_angle": 0.0,
+            "right_angle": 0.0,
+            "left_attack": False,
+            "right_attack": False,
+            "combo": False
+        }
+
 
 def detect_arm_raises(landmarks):
     try:
@@ -680,11 +711,11 @@ def resolve_hit(attacker, defender):
     if distance > PUNCH_RANGE:
         return False
     if attacker.action == "punch_left" and attacker.action_timer > 10:
-        defender.take_damage(5); attacker.action_timer = 10
+        defender.take_damage(7); attacker.action_timer = 10
         if AUDIO_OK: sfx_hit.play()
         return True
     if attacker.action == "punch_right" and attacker.action_timer > 10:
-        defender.take_damage(5); attacker.action_timer = 10
+        defender.take_damage(7); attacker.action_timer = 10
         if AUDIO_OK: sfx_hit.play()
         return True
     if attacker.action == "combo" and attacker.action_timer > 20:
@@ -701,6 +732,8 @@ def reset_game():
     global v_ok_frames, v_active
     global ext_mid_ok, ext_ring_ok
     global last_both_fire_time, both_armed, both_inactive_frames
+    global SIGNALS, EVENT_COUNTS
+    global enemy_last_attack_time  # for AI cooldown
 
     player = Fighter(100, GAME_HEIGHT - 50, True, (50,170,255))
     enemy  = Fighter(300, GAME_HEIGHT - 50, False,(240, 90, 90))
@@ -724,9 +757,10 @@ def reset_game():
     both_armed = True
     both_inactive_frames = 0
 
-    global SIGNALS, EVENT_COUNTS
     SIGNALS = defaultdict(list)
     EVENT_COUNTS = defaultdict(int)
+
+    enemy_last_attack_time = 0.0
 
 # =========================
 # Gesture tuning (two hands, edge-trigger, anti-fist)
@@ -751,7 +785,7 @@ EXT_LEN_RATIO_MIN = 1.45
 
 # Two-hand latch
 FIREBALL_COOLDOWN     = 0.30
-FIREBALL_DAMAGE       = 4 #12
+FIREBALL_DAMAGE       = 10 #12
 BOTH_RELEASE_FRAMES   = 6  # how many frames BOTH must be inactive to re-arm
 
 # =========================
@@ -792,6 +826,17 @@ both_inactive_frames = 0
 
 round_over = False
 round_end_time = None
+
+# Enemy AI state
+enemy_last_attack_time = 0.0
+
+# =========================
+# Enemy AI parameters (less aggressive)
+# =========================
+ENEMY_APPROACH_EVERY_FRAMES = 30
+ENEMY_ATTACK_COOLDOWN_SEC   = 2.0
+ENEMY_COMBO_CHANCE          = 0.1
+ENEMY_ATTACK_RANGE_PAD      = 0
 
 # =========================
 # Main loop
@@ -872,12 +917,13 @@ try:
             left_up  = raise_info.get("left_raised", False)
             right_up = raise_info.get("right_raised", False)
 
-            log_signal("pose.left_elbow_deg",  lh, t_rel)
-            log_signal("pose.right_elbow_deg", rh, t_rel)
-            log_signal("pose.left_shoulder_raise",  left_up,  t_rel)
-            log_signal("pose.right_shoulder_raise", right_up, t_rel)
+            # 这里的角度记录你之前做了镜像显示（左右互换），我保留原样
+            log_signal("pose.right_elbow_deg",  lh if lh is not None else None, t_rel)
+            log_signal("pose.left_elbow_deg",  rh if rh is not None else None, t_rel)
+            log_signal("pose.right_shoulder_raise",  left_up,  t_rel)
+            log_signal("pose.left_shoulder_raise", right_up, t_rel)
 
-            # HANDS: V-split w/ extension + hysteresis (two-hands latch handled later)
+            # HANDS: V-split w/ extension + hysteresis
             if hands_results and hands_results.multi_hand_landmarks:
                 labels = []
                 if hands_results.multi_handedness:
@@ -900,10 +946,8 @@ try:
 
                     if hlm3d is not None:
                         angle3d, r_idx_mid, r_ring_pky = per_hand_metrics(hlm2d.landmark, hlm3d.landmark)
-                        mid_ext  = finger_extended(hlm2d.landmark, hlm3d.landmark, 9, 10, 11, 12,
-                                                   EXT_PIP_MIN_DEG, EXT_DIP_MIN_DEG, EXT_LEN_RATIO_MIN)
-                        ring_ext = finger_extended(hlm2d.landmark, hlm3d.landmark,13, 14, 15, 16,
-                                                   EXT_PIP_MIN_DEG, EXT_DIP_MIN_DEG, EXT_LEN_RATIO_MIN)
+                        mid_ext  = finger_extended(hlm2d.landmark, hlm3d.landmark, 9, 10, 11, 12)
+                        ring_ext = finger_extended(hlm2d.landmark, hlm3d.landmark,13, 14, 15, 16)
                     else:
                         # 2D fallback (less strict)
                         def _vec2d(tip, mcp):
@@ -968,10 +1012,10 @@ try:
                     for finger_name, joints in fj.items():
                         for joint_name, deg in joints.items():
                             log_signal(f"hands.{label}.{finger_name}.{joint_name}_deg", deg, t_rel)
-            # else: keep v_active as-is (we require both inactive to re-arm anyway)
+            # else: keep v_active as-is
 
         # ---- TWO-HANDS latch (single shot while held open)
-        both_active = v_active["Left"] and v_active["Right"]
+        both_active = v_active.get("Left", False) and v_active.get("Right", False)
         if both_active:
             city.update(now)  # keep windows blinking even while held
             both_inactive_frames = 0
@@ -984,52 +1028,90 @@ try:
                 both_armed = False
         else:
             # re-arm only after BOTH are inactive together for a few frames
-            if not v_active["Left"] and not v_active["Right"]:
+            if not v_active.get("Left", False) and not v_active.get("Right", False):
                 both_inactive_frames = min(60, both_inactive_frames + 1)
                 if both_inactive_frames >= BOTH_RELEASE_FRAMES:
                     both_armed = True
             else:
                 both_inactive_frames = 0
 
-        # ---- Movement from shoulder raises
-        left_up = raise_info.get("left_raised", False)
+        # ---- Movement from shoulder raises (mirrored)
+        left_up  = raise_info.get("left_raised", False)
         right_up = raise_info.get("right_raised", False)
+
         if now - last_move_time > MOVE_COOLDOWN:
-            if right_up and not prev_right_raise:
-                player.move_forward(); last_move_time = now
-                EVENT_COUNTS["move_forward"] += 1
-            elif left_up and not prev_left_raise:
-                player.move_backward(); last_move_time = now
-                EVENT_COUNTS["move_backward"] += 1
+            if MIRROR_INPUT:
+                # 镜像：左肩=前进，右肩=后退
+                if left_up and not prev_left_raise:
+                    player.move_forward(); last_move_time = now
+                    EVENT_COUNTS["move_forward"] += 1
+                elif right_up and not prev_right_raise:
+                    player.move_backward(); last_move_time = now
+                    EVENT_COUNTS["move_backward"] += 1
+            else:
+                # 原逻辑：右肩=前进，左肩=后退
+                if right_up and not prev_right_raise:
+                    player.move_forward(); last_move_time = now
+                    EVENT_COUNTS["move_forward"] += 1
+                elif left_up and not prev_left_raise:
+                    player.move_backward(); last_move_time = now
+                    EVENT_COUNTS["move_backward"] += 1
         prev_left_raise = left_up; prev_right_raise = right_up
 
-        # ---- Attacks from elbow angles
-        left_ready = angles_info.get("left_attack", False)
-        right_ready = angles_info.get("right_attack", False)
-        combo_ready = angles_info.get("combo", False)
+        # ---- Attacks from elbow angles (mirrored punches)
+        left_ready  = angles_info.get("left_attack", False)    # CHANGED: 内部已改为 >90°
+        right_ready = angles_info.get("right_attack", False)   # CHANGED: 内部已改为 >90°
+        combo_ready = angles_info.get("combo", False)          # CHANGED: 双侧 >90°
+
         if now - last_attack_time > ATTACK_COOLDOWN:
             if combo_ready and not (prev_left_attack and prev_right_attack):
-                if player.combo_attack(): last_attack_time = now
-                EVENT_COUNTS["combo_attack"] += 1
+                if player.combo_attack():
+                    last_attack_time = now
+                    EVENT_COUNTS["combo_attack"] += 1
             else:
-                if left_ready and not prev_left_attack:
-                    if player.punch_left(): last_attack_time = now
-                    EVENT_COUNTS["punch_left"] += 1
-                elif right_ready and not prev_right_attack:
-                    if player.punch_right(): last_attack_time = now
-                    EVENT_COUNTS["punch_right"] += 1
-        prev_left_attack = left_ready; prev_right_attack = right_ready
+                if MIRROR_INPUT:
+                    # 镜像：左肘触发右拳；右肘触发左拳
+                    if left_ready and not prev_left_attack:
+                        if player.punch_right(): last_attack_time = now
+                        EVENT_COUNTS["punch_right"] += 1
+                    elif right_ready and not prev_right_attack:
+                        if player.punch_left(): last_attack_time = now
+                        EVENT_COUNTS["punch_left"] += 1
+                else:
+                    # 原逻辑
+                    if left_ready and not prev_left_attack:
+                        if player.punch_left(): last_attack_time = now
+                        EVENT_COUNTS["punch_left"] += 1
+                    elif right_ready and not prev_right_attack:
+                        if player.punch_right(): last_attack_time = now
+                        EVENT_COUNTS["punch_right"] += 1
+        prev_left_attack  = left_ready
+        prev_right_attack = right_ready
 
-        # ---- Update fighters & AI
+        # ---- Update fighters
         player.update(); enemy.update()
         player.facing_right = (enemy.x > player.x)
         enemy.facing_right  = (player.x > enemy.x)
 
-        if frame_count % 120 == 0:
-            if abs(player.x - enemy.x) > PUNCH_RANGE:
-                (enemy.move_forward() if player.x > enemy.x else enemy.move_backward())
+        # ---- Enemy AI (less aggressive)
+        dist = abs(player.x - enemy.x)
+
+        if frame_count % ENEMY_APPROACH_EVERY_FRAMES == 0:
+            if dist > (PUNCH_RANGE - ENEMY_ATTACK_RANGE_PAD):
+                enemy.move_forward()
             else:
-                random.choice([enemy.punch_left, enemy.punch_right, enemy.combo_attack])()
+                if dist < PUNCH_RANGE * 0.6 and random.random() < 0.2:
+                    enemy.move_backward()
+
+        if (dist <= (PUNCH_RANGE - ENEMY_ATTACK_RANGE_PAD)) and (now - enemy_last_attack_time > ENEMY_ATTACK_COOLDOWN_SEC):
+            if random.random() < ENEMY_COMBO_CHANCE and enemy.combo_cooldown <= 0:
+                enemy.combo_attack()
+            else:
+                if enemy.facing_right:
+                    (enemy.punch_right() if random.random() < 0.6 else enemy.punch_left())
+                else:
+                    (enemy.punch_left() if random.random() < 0.6 else enemy.punch_right())
+            enemy_last_attack_time = now
 
         # ---- Resolve melee
         resolve_hit(player, enemy); resolve_hit(enemy, player)
@@ -1061,26 +1143,33 @@ try:
         if ret:
             overlay = frame.copy()
 
-            # Shoulder HUD
-            cv2.putText(overlay, f"Left shoulder RAISE: {'YES' if left_up else 'no'} (Back)",
+            # Shoulder HUD（文本根据镜像与否更新提示）
+            if MIRROR_INPUT:
+                left_tip  = "Left shoulder RAISE: Move FORWARD"
+                right_tip = "Right shoulder RAISE: Move BACKWARD"
+            else:
+                left_tip  = "Left shoulder RAISE: Move BACKWARD"
+                right_tip = "Right shoulder RAISE: Move FORWARD"
+
+            cv2.putText(overlay, f"{left_tip.split(':')[0]}: {'YES' if left_up else 'no'} ({left_tip.split(':')[1].strip()})",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0) if left_up else (200,200,200), 2, cv2.LINE_AA)
-            cv2.putText(overlay, f"Right shoulder RAISE: {'YES' if right_up else 'no'} (Forward)",
+            cv2.putText(overlay, f"{right_tip.split(':')[0]}: {'YES' if right_up else 'no'} ({right_tip.split(':')[1].strip()})",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0) if right_up else (200,200,200), 2, cv2.LINE_AA)
 
-            # Elbow HUD
+            # Elbow HUD（数值仍以 >=90° 显示为绿色，符合新规则）
             lh = angles_info.get("left_angle"); rh = angles_info.get("right_angle")
             base_y = 85
             if lh is not None:
-                cv2.putText(overlay, f"Left elbow angle: {lh:5.1f}°", (10, base_y),
+                cv2.putText(overlay, f"Right elbow angle: {lh:5.1f}°", (10, base_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0) if lh >= 90 else (0,0,255), 2, cv2.LINE_AA)
             else:
-                cv2.putText(overlay, "Left elbow angle: --", (10, base_y),
+                cv2.putText(overlay, "Right elbow angle: --", (10, base_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
             if rh is not None:
-                cv2.putText(overlay, f"Right elbow angle: {rh:5.1f}°", (10, base_y+50),
+                cv2.putText(overlay, f"Left elbow angle: {rh:5.1f}°", (10, base_y+50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0) if rh >= 90 else (0,0,255), 2, cv2.LINE_AA)
             else:
-                cv2.putText(overlay, "Right elbow angle: --", (10, base_y+50),
+                cv2.putText(overlay, "Left elbow angle: --", (10, base_y+50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
 
             # V-split + extension HUD
@@ -1109,16 +1198,25 @@ try:
             frame_surface = pygame.transform.scale(frame_surface, (CAMERA_WIDTH, CAMERA_HEIGHT))
             screen.blit(frame_surface, (0, 0))
 
-            # Instructions
+            # Instructions (auto reflect MIRROR_INPUT) — CHANGED 文案 “>90°”
+            if MIRROR_INPUT:
+                move_line1 = "Left shoulder RAISE = Move FORWARD"
+                move_line2 = "Right shoulder RAISE = Move BACKWARD"
+                atk_line   = "Left >90° = Right Attack (-7) | Right >90° = Left Attack (-7)"
+            else:
+                move_line1 = "Left shoulder RAISE = Move BACKWARD"
+                move_line2 = "Right shoulder RAISE = Move FORWARD"
+                atk_line   = "Left >90° = Left Attack (-7) | Right >90° = Right Attack (-7)"
+
             instructions = [
                 "MOVEMENT (Shoulder Raises):",
-                "Left shoulder RAISE = Move BACKWARD",
-                "Right shoulder RAISE = Move FORWARD",
+                move_line1,
+                move_line2,
                 "ATTACK (Elbow Angles):",
-                "Left <90° = Left Attack (-5) | Right <90° = Right Attack (-5)",
-                "Both <90° = COMBO (-15)",
+                atk_line,
+                "Both >90° = COMBO (-15)",
                 "SPECIAL (two hands required):",
-                "Open/split BOTH hands (mid+ring extended) = FIREBALL (-12)",
+                "Open/split BOTH hands (mid+ring extended) = FIREBALL (-10)",
                 f"Fires once while held; re-arms after both hands relax ({BOTH_RELEASE_FRAMES} frames).",
                 "Audio: M mute, [ vol-, ] vol+"
             ]
